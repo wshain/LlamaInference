@@ -1,11 +1,21 @@
 #include <base/cuda_config.h>
+#include <base/tick.h>
 #include <tensor/tensor.h>
 #include <cfloat>
 #include <cub/cub.cuh>
 #include "mha_kernel.cuh"
-#include <base/tick.h>
 namespace kernel {
 constexpr static int thread_num = 256;
+/**
+ * 在 GPU 上对一个数组执行 in-place Softmax 操作
+ *
+ * 功能: 对输入数组 x 执行 softmax: x[i] = exp(x[i] - max) / sum(exp(x[j] - max))
+ * 使用 CUB 库进行高效的 block 内归约（reduce）
+ *
+ * 参数:
+ *   x     - 输入/输出数组，shape: [size]，softmax 后结果写回原数组
+ *   size  - 数组长度（通常是 seq_len，即注意力分数的序列长度）
+ */
 __device__ void softmax_gpu(float* __restrict__ x, int size) {
   int tid = threadIdx.x;
   int step = blockDim.x;
@@ -13,39 +23,52 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
   // find max value (for numerical stability)
   // this should be FLT_MAX, not 0 !!!!
   // otherwise, the softmax may be occur nan when head_dim < 128 threads
+  // ================= 第一步：找最大值（用于数值稳定）=================
+  // 初始化 max_val：如果线程 ID 小于 size，则取 x[tid]，否则设为 -FLT_MAX
+  // 这是为了避免越界线程影响最大值计算
   float max_val = tid < size ? x[tid] : -FLT_MAX;
+  // 使用 grid-stride loop 在 block 内并行查找局部最大值
+  // 每个线程从 tid + step 开始，每隔 step 个元素检查一次
   for (int i = tid + step; i < size; i += step) {
     if (x[i] > max_val) {
       max_val = x[i];
     }
   }
-  using BlockReduce = cub::BlockReduce<float, thread_num>;
-  __shared__ BlockReduce::TempStorage temp;
-  __shared__ float shared_val;
+  // 使用 CUB 的 BlockReduce 进行 block 内归约（求最大值）
+  using BlockReduce = cub::BlockReduce<float, thread_num>;  // 假设 thread_num 是编译期常量
+  __shared__ BlockReduce::TempStorage temp;                 // 共享内存，用于 CUB 归约
+  __shared__ float shared_val;                              // 用于存储归约结果（max 和 sum）
+  // 执行归约操作：所有线程协作，找出整个 block 中的最大值
   max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+  // 只有主线程（threadIdx.x == 0）保存结果到共享内存
   if (threadIdx.x == 0) {
     shared_val = max_val;
   }
   __syncthreads();
+  // 所有线程读取最大值
   max_val = shared_val;
 
+  // ================= 第二步：计算 exp(x[i] - max_val) 并求和 =================
   float sum = 0.0f;
   for (int i = tid; i < size; i += step) {
-    x[i] = expf(x[i] - max_val);
-    sum += x[i];
+    x[i] = expf(x[i] - max_val);  // in-place 计算 exp(x[i] - max)，提升数值稳定性
+    sum += x[i];                  // 累加局部和
   }
+  // 使用 BlockReduce 对 sum 进行 block 内归约（求和）
   sum = BlockReduce(temp).Sum(sum);
+  // 主线程保存总和
   if (threadIdx.x == 0) {
     shared_val = sum;
   }
   __syncthreads();
+  // 所有线程读取总和
   sum = shared_val;
-
+  // ================= 第三步：归一化：x[i] /= sum =================
   for (int i = tid; i < size; i += step) {
+    // 每个元素除以总和，完成 softmax
     x[i] /= sum;
   }
 }
-
 
 __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float* query,
                                             float* score_ptr, float* output, float* key_cache,
